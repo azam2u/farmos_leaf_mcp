@@ -1,0 +1,7 @@
+farmOS>=1.0
+mcp
+opencv-python>=4.8
+ultralytics
+numpy
+requests
+pyzmq
