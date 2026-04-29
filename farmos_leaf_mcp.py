@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 import datetime
 import glob
+import html
 import json
 import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
 import time
+import copy
+from urllib.parse import urljoin
 from contextlib import contextmanager
 from typing import Optional, Tuple
 
@@ -39,6 +43,8 @@ YOLO_LIVE_PREVIEW_ON_ASK = os.environ.get("LEAF_YOLO_LIVE_PREVIEW_ON_ASK", "1").
 CAPTURE_LIVE_INFERENCE = os.environ.get("LEAF_CAPTURE_LIVE_INFERENCE", "1").strip().lower() not in {"0", "false", "no"}
 CAPTURE_LIVE_WINDOW_TITLE = os.environ.get("LEAF_CAPTURE_LIVE_WINDOW_TITLE", "FarmOS Capture Live Inference")
 CAPTURE_DIR = os.environ.get("LEAF_CAPTURE_DIR", os.path.join(SCRIPT_DIR, "captures"))
+NOTES_HTML_FORMAT = os.environ.get("LEAF_NOTES_HTML_FORMAT", "default").strip() or "default"
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
 
 MAPBOX_TOKEN = os.environ.get(
     "MAPBOX_TOKEN",
@@ -65,6 +71,10 @@ CAMERA_LOCK_TIMEOUT_SECONDS = float(os.environ.get("LEAF_CAMERA_LOCK_TIMEOUT_SEC
 
 GPS_DEVICE = os.environ.get("GPS_DEVICE", "/dev/ttyACM0")
 GPS_READ_TIMEOUT_SECONDS = float(os.environ.get("GPS_READ_TIMEOUT_SECONDS", "25"))
+PLANT_EXPORT_DIR = os.environ.get("LEAF_EXPORT_DIR", os.path.join(SCRIPT_DIR, "plant_exports"))
+LOG_BUNDLES = ["activity", "harvest", "input", "maintenance", "observation", "seeding"]
+PENDING_EXPORT_REQUESTS = {}
+PENDING_EXPORT_TTL_SECONDS = int(os.environ.get("LEAF_EXPORT_SELECTION_TTL_SECONDS", "1800"))
 
 
 def get_client():
@@ -493,7 +503,87 @@ def extract_llm_paragraph_pairs(remote_text: str) -> list[tuple[str, str, str]]:
     return []
 
 
-def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: float, image_path: str, mode: str):
+def _build_asset_notes_field(
+    note_lines: list[str],
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    coordinate_source: str = "",
+):
+    if latitude is None or longitude is None:
+        return {"value": "\n".join(note_lines), "format": "plain_text"}
+
+    lat = float(latitude)
+    lon = float(longitude)
+    source = coordinate_source.strip() or "provided"
+    map_view_url = f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+    mapbox_static_url = ""
+    if MAPBOX_TOKEN:
+        mapbox_static_url = (
+            "https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/"
+            f"pin-s+ff0000({lon:.6f},{lat:.6f})/{lon:.6f},{lat:.6f},18/800x800"
+            f"?access_token={MAPBOX_TOKEN}"
+        )
+    google_static_url = ""
+    if GOOGLE_MAPS_API_KEY:
+        google_static_url = (
+            "https://maps.googleapis.com/maps/api/staticmap"
+            f"?center={lat:.6f},{lon:.6f}&zoom=18&size=800x800&markers=color:red%7C{lat:.6f},{lon:.6f}"
+            f"&key={GOOGLE_MAPS_API_KEY}"
+        )
+    coord_label = f"{lat:.6f}, {lon:.6f}"
+
+    lines = list(note_lines)
+    lines.append(f"Coordinates ({source}): {coord_label}")
+    lines.append("Coordinate map (interactive, Google Maps):")
+    lines.append(map_view_url)
+    if google_static_url:
+        lines.append("Coordinate map image (Google Static Maps, marked point):")
+        lines.append(google_static_url)
+    if mapbox_static_url:
+        lines.append("Coordinate map image (Mapbox static, marked point):")
+        lines.append(mapbox_static_url)
+    if not google_static_url:
+        lines.append("Note: Set GOOGLE_MAPS_API_KEY to enable Google Static Maps image link.")
+    return {"value": "\n".join(lines), "format": "plain_text"}
+
+
+def _notes_field_to_plain_text(notes_field: dict) -> dict:
+    value = str((notes_field or {}).get("value", "") or "")
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r'<a [^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        r"\2 (\1)",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(r"<[^>]+>", "", value)
+    return {"value": html.unescape(value).strip(), "format": "plain_text"}
+
+
+def _send_asset_with_notes_fallback(farm, bundle: str, payload: dict):
+    try:
+        return farm.asset.send(bundle, payload)
+    except Exception as exc:
+        message = str(exc)
+        notes = ((payload.get("attributes") or {}).get("notes") or {})
+        if "422" not in message or not isinstance(notes, dict) or notes.get("format") == "plain_text":
+            raise
+        fallback_payload = copy.deepcopy(payload)
+        fallback_payload["attributes"]["notes"] = _notes_field_to_plain_text(notes)
+        return farm.asset.send(bundle, fallback_payload)
+
+
+def upsert_plant_asset(
+    farm,
+    asset_name: str,
+    predicted_label: str,
+    confidence: float,
+    image_path: str,
+    mode: str,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    coordinate_source: str = "",
+):
     global LAST_ASSET_ID, LAST_ASSET_TYPE, LAST_ASSET_NAME, LAST_ASSET_TS
 
     existing = find_existing_plant_assets(farm, asset_name)
@@ -569,7 +659,12 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
             )
     if non_plant_detected:
         asset_name = make_unknown_name()
-    note_text = "\n".join(note_lines)
+    notes_field = _build_asset_notes_field(
+        note_lines=note_lines,
+        latitude=latitude,
+        longitude=longitude,
+        coordinate_source=coordinate_source,
+    )
 
     if existing and mode == "overwrite":
         payload = {
@@ -577,7 +672,7 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
             "attributes": {
                 "name": asset_name,
                 "status": "active",
-                "notes": {"value": note_text, "format": "plain_text"},
+                "notes": notes_field,
             },
             "relationships": {},
         }
@@ -585,7 +680,7 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
             payload["relationships"]["plant_type"] = {
                 "data": [{"type": "taxonomy_term--plant_type", "id": plant_type_term_id}]
             }
-        response = farm.asset.send("plant", payload)
+        response = _send_asset_with_notes_fallback(farm, "plant", payload)
         asset_id = response.get("data", {}).get("id") or response.get("id") or existing_id
         doc_note = ""
         if remote_doc_text:
@@ -622,7 +717,7 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
         "attributes": {
             "name": asset_name,
             "status": "active",
-            "notes": {"value": note_text, "format": "plain_text"},
+            "notes": notes_field,
         },
         "relationships": {},
     }
@@ -631,7 +726,7 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
             "data": [{"type": "taxonomy_term--plant_type", "id": plant_type_term_id}]
         }
 
-    response = farm.asset.send("plant", payload)
+    response = _send_asset_with_notes_fallback(farm, "plant", payload)
     asset_id = response.get("data", {}).get("id") or response.get("id")
     doc_note = ""
     if remote_doc_text:
@@ -667,8 +762,28 @@ def upsert_plant_asset(farm, asset_name: str, predicted_label: str, confidence: 
     }
 
 
-def create_or_update_plant_asset(farm, asset_name: str, predicted_label: str, confidence: float, image_path: str, mode: str) -> str:
-    return upsert_plant_asset(farm, asset_name, predicted_label, confidence, image_path, mode)["message"]
+def create_or_update_plant_asset(
+    farm,
+    asset_name: str,
+    predicted_label: str,
+    confidence: float,
+    image_path: str,
+    mode: str,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    coordinate_source: str = "",
+) -> str:
+    return upsert_plant_asset(
+        farm,
+        asset_name,
+        predicted_label,
+        confidence,
+        image_path,
+        mode,
+        latitude=latitude,
+        longitude=longitude,
+        coordinate_source=coordinate_source,
+    )["message"]
 
 
 def _annotate_frame_with_yolo(model, frame):
@@ -679,6 +794,10 @@ def _annotate_frame_with_yolo(model, frame):
     result = results[0] if results else None
     if result is not None:
         annotated = result.plot()
+        # Ultralytics plotting can return a read-only view in some environments.
+        # OpenCV drawing ops (putText, etc.) require a writable contiguous buffer.
+        if not annotated.flags.writeable or not annotated.flags.c_contiguous:
+            annotated = np.ascontiguousarray(annotated).copy()
         if result.boxes is not None and len(result.boxes) > 0:
             best_idx = int(result.boxes.conf.argmax().item())
             confidence = float(result.boxes.conf[best_idx].item() * 100.0)
@@ -721,6 +840,8 @@ def capture_frames(camera_index: int, image_count: int, interval_seconds: float,
                         confidence = 0.0
                         if model is not None:
                             overlay, label, confidence = _annotate_frame_with_yolo(model, frame)
+                        if not overlay.flags.writeable or not overlay.flags.c_contiguous:
+                            overlay = np.ascontiguousarray(overlay).copy()
                         remaining = max(0.0, capture_at - time.time())
                         cv2.putText(
                             overlay,
@@ -1093,6 +1214,419 @@ def run_mapbox_segment_and_apply_geometry(asset_id, asset_type, latitude, longit
     }
 
 
+def _safe_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    return cleaned.strip("._") or "unnamed"
+
+
+def _text_value(field) -> str:
+    if field is None:
+        return ""
+    if isinstance(field, str):
+        return field.strip()
+    if isinstance(field, dict):
+        if "value" in field and field["value"] is not None:
+            return str(field["value"]).strip()
+        if "processed" in field and field["processed"] is not None:
+            return str(field["processed"]).strip()
+        return json.dumps(field, ensure_ascii=False)
+    if isinstance(field, list):
+        parts = [_text_value(v) for v in field]
+        return "\n".join([p for p in parts if p])
+    return str(field).strip()
+
+
+def _asset_summary_line(asset: dict, idx: int) -> str:
+    attrs = asset.get("attributes", {})
+    name = attrs.get("name", "Unnamed")
+    archived = attrs.get("archived", False)
+    status = attrs.get("status", "unknown")
+    asset_id = str(asset.get("id", "")).strip()
+    return (
+        f"{idx}. {name} | id={asset_id} | status={status} | archived={archived}"
+    )
+
+
+def _find_plant_assets_by_name(farm, plant_name: str, limit: int = 200) -> list[dict]:
+    query = plant_name.strip().lower()
+    if not query:
+        return []
+    matches = []
+    for asset in farm.asset.iterate("plant", params={"page[limit]": 100}):
+        name = str((asset.get("attributes") or {}).get("name", "")).strip()
+        if query in name.lower():
+            matches.append(asset)
+        if len(matches) >= max(1, limit):
+            break
+    matches.sort(key=lambda a: str((a.get("attributes") or {}).get("name", "")).lower())
+    return matches
+
+
+def _download_file_entity(farm, file_id: str, out_dir: str) -> str:
+    url = f"{HOSTNAME.rstrip('/')}/api/file/file/{file_id}"
+    response = farm.session.get(url, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"File entity lookup failed for {file_id}: {response.status_code}")
+
+    entity = response.json().get("data", {})
+    attrs = entity.get("attributes", {})
+    filename = attrs.get("filename") or f"{file_id}.bin"
+    uri = attrs.get("uri") or {}
+    file_url = uri.get("url")
+    if not file_url:
+        raise RuntimeError(f"File entity {file_id} has no downloadable URL.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    download_url = urljoin(f"{HOSTNAME.rstrip('/')}/", file_url.lstrip("/"))
+    binary = farm.session.get(download_url, timeout=60)
+    if binary.status_code != 200:
+        raise RuntimeError(f"File download failed for {file_id}: {binary.status_code}")
+
+    safe_filename = _safe_name(filename)
+    out_path = os.path.join(out_dir, f"{file_id[:8]}_{safe_filename}")
+    with open(out_path, "wb") as f:
+        f.write(binary.content)
+    return out_path
+
+
+def _collect_file_ids(entity: dict) -> list[str]:
+    rel = entity.get("relationships") or {}
+    file_ids = []
+    for rel_name in ("image", "file"):
+        entries = ((rel.get(rel_name) or {}).get("data") or [])
+        for entry in entries:
+            if str(entry.get("type", "")).strip() == "file--file":
+                file_id = str(entry.get("id", "")).strip()
+                if file_id:
+                    file_ids.append(file_id)
+    return file_ids
+
+
+def _fetch_logs_for_asset(farm, asset_id: str) -> list[dict]:
+    logs = []
+    for bundle in LOG_BUNDLES:
+        try:
+            for log_item in farm.log.iterate(bundle, params={"filter[asset.id]": asset_id, "page[limit]": 100}):
+                logs.append(log_item)
+        except Exception:
+            continue
+    return logs
+
+
+def _parse_iso_datetime(value: str) -> Optional[datetime.datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _fetch_activity_logs_for_asset(farm, asset_id: str, days_back: int = 30) -> list[dict]:
+    params = {"filter[asset.id]": asset_id, "page[limit]": 100}
+    logs = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    max_age_days = max(0, int(days_back))
+    for log_item in farm.log.iterate("activity", params=params):
+        if max_age_days <= 0:
+            logs.append(log_item)
+            continue
+        ts = _parse_iso_datetime((log_item.get("attributes") or {}).get("timestamp"))
+        if ts is None:
+            logs.append(log_item)
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        age_days = (now - ts.astimezone(datetime.timezone.utc)).total_seconds() / 86400.0
+        if age_days <= max_age_days:
+            logs.append(log_item)
+    return logs
+
+
+def _collect_image_file_ids(entity: dict) -> list[str]:
+    rel = entity.get("relationships") or {}
+    file_ids = []
+    entries = ((rel.get("image") or {}).get("data") or [])
+    for entry in entries:
+        if str(entry.get("type", "")).strip() == "file--file":
+            file_id = str(entry.get("id", "")).strip()
+            if file_id:
+                file_ids.append(file_id)
+    return file_ids
+
+
+def _is_plant_image_by_yolo(image_path: str, min_confidence_percent: float) -> tuple[bool, str, float, str]:
+    """
+    Uses the existing YOLO pipeline only to classify whether this image looks like a plant.
+    No asset/name changes are performed here.
+    """
+    try:
+        label, confidence = classify_image(image_path)
+        is_plant = bool(label.strip()) and float(confidence) >= float(min_confidence_percent)
+        return is_plant, label, float(confidence), ""
+    except Exception as exc:
+        return False, "", 0.0, str(exc)
+
+
+def _compute_phash(image_path: str, hash_size: int = 8, highfreq_factor: int = 4) -> int:
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise RuntimeError(f"Could not read image for pHash: {image_path}")
+    size = hash_size * highfreq_factor
+    resized = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+    dct = cv2.dct(np.float32(resized))
+    low = dct[:hash_size, :hash_size]
+    flat = low.flatten()
+    median_val = np.median(flat[1:]) if flat.size > 1 else np.median(flat)
+    bits = (flat > median_val).astype(np.uint8)
+
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    return value
+
+
+def _hamming_distance(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def _group_duplicates(records: list[dict], max_distance: int) -> list[list[int]]:
+    if not records:
+        return []
+    n = len(records)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int):
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _hamming_distance(int(records[i]["phash"]), int(records[j]["phash"]))
+            if d <= max_distance:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+    return [idxs for idxs in groups.values() if len(idxs) > 1]
+
+
+def _choose_keep_index(records: list[dict], idxs: list[int], keep_policy: str) -> int:
+    policy = keep_policy.strip().lower()
+    if policy == "newest":
+        return max(idxs, key=lambda i: float(records[i].get("order_key", 0.0)))
+    if policy == "oldest":
+        return min(idxs, key=lambda i: float(records[i].get("order_key", 0.0)))
+    return max(idxs, key=lambda i: float(records[i].get("confidence", 0.0)))
+
+
+def _delete_file_entity(farm, file_id: str) -> tuple[bool, str]:
+    url = f"{HOSTNAME.rstrip('/')}/api/file/file/{file_id}"
+    response = farm.session.delete(url, timeout=30)
+    if response.status_code in (200, 202, 204):
+        return True, ""
+    detail = (response.text or "").strip()
+    if len(detail) > 400:
+        detail = detail[:400] + "..."
+    return False, f"{response.status_code} {detail}"
+
+
+def _fetch_file_entity_filename(farm, file_id: str) -> str:
+    url = f"{HOSTNAME.rstrip('/')}/api/file/file/{file_id}"
+    response = farm.session.get(url, timeout=30)
+    if response.status_code != 200:
+        return ""
+    data = response.json().get("data", {})
+    attrs = data.get("attributes") or {}
+    return str(attrs.get("filename") or "").strip()
+
+
+def _delete_local_capture_files_by_filename(local_capture_dir: str, filename: str) -> tuple[int, list[str]]:
+    if not filename.strip():
+        return 0, []
+    if not os.path.isdir(local_capture_dir):
+        return 0, []
+
+    deleted = 0
+    errors = []
+    for entry in os.listdir(local_capture_dir):
+        if entry != filename:
+            continue
+        path = os.path.join(local_capture_dir, entry)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            deleted += 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return deleted, errors
+
+
+def _unlink_image_from_activity_log(farm, log_item: dict, file_id: str) -> tuple[bool, str]:
+    log_id = str(log_item.get("id", "")).strip()
+    if not log_id:
+        return False, "Missing log id."
+
+    existing_image_entries = ((log_item.get("relationships") or {}).get("image") or {}).get("data") or []
+    filtered = [
+        entry for entry in existing_image_entries
+        if str(entry.get("id", "")).strip() != file_id
+    ]
+    if len(filtered) == len(existing_image_entries):
+        return True, ""
+
+    payload = {
+        "id": log_id,
+        "relationships": {
+            "image": {
+                "data": filtered
+            }
+        },
+    }
+    try:
+        farm.log.send("activity", payload)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _unlink_images_from_activity_log(farm, log_item: dict, file_ids_to_remove: set[str]) -> tuple[int, str]:
+    """
+    Remove multiple image file IDs from one activity log in a single relationship update.
+    Returns (removed_count, error_message).
+    """
+    log_id = str(log_item.get("id", "")).strip()
+    if not log_id:
+        return 0, "Missing log id."
+    if not file_ids_to_remove:
+        return 0, ""
+
+    existing_image_entries = ((log_item.get("relationships") or {}).get("image") or {}).get("data") or []
+    filtered = []
+    removed = 0
+    for entry in existing_image_entries:
+        fid = str(entry.get("id", "")).strip()
+        if fid and fid in file_ids_to_remove:
+            removed += 1
+            continue
+        filtered.append(entry)
+
+    if removed == 0:
+        return 0, ""
+
+    payload = {
+        "id": log_id,
+        "relationships": {
+            "image": {
+                "data": filtered
+            }
+        },
+    }
+    try:
+        farm.log.send("activity", payload)
+        return removed, ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def _cleanup_pending_export_requests():
+    now = time.time()
+    expired = [
+        token for token, item in PENDING_EXPORT_REQUESTS.items()
+        if now - float(item.get("created_at", 0.0)) > float(PENDING_EXPORT_TTL_SECONDS)
+    ]
+    for token in expired:
+        PENDING_EXPORT_REQUESTS.pop(token, None)
+
+
+def _create_pending_export_request(plant_name: str, matches: list[dict]) -> str:
+    token = secrets.token_urlsafe(16)
+    PENDING_EXPORT_REQUESTS[token] = {
+        "plant_name": plant_name.strip(),
+        "created_at": time.time(),
+        "asset_ids": [str(a.get("id", "")).strip() for a in matches],
+        "asset_names": [str((a.get("attributes") or {}).get("name", "")).strip() for a in matches],
+    }
+    return token
+
+
+def _export_single_asset_data(farm, asset: dict, export_root: str) -> dict:
+    asset_id = str(asset.get("id", "")).strip()
+    attrs = asset.get("attributes") or {}
+    asset_name = str(attrs.get("name", "Unnamed"))
+    folder_name = f"{_safe_name(asset_name)}_{asset_id[:8]}"
+    asset_dir = os.path.join(export_root, folder_name)
+    logs_dir = os.path.join(asset_dir, "logs")
+    files_dir = os.path.join(asset_dir, "files")
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(files_dir, exist_ok=True)
+
+    with open(os.path.join(asset_dir, "asset.json"), "w", encoding="utf-8") as f:
+        json.dump(asset, f, indent=2, ensure_ascii=False)
+
+    asset_notes = _text_value(attrs.get("notes"))
+    if asset_notes:
+        with open(os.path.join(asset_dir, "asset_notes.txt"), "w", encoding="utf-8") as f:
+            f.write(asset_notes + "\n")
+
+    downloaded = []
+    seen_file_ids = set()
+
+    for fid in _collect_file_ids(asset):
+        if fid in seen_file_ids:
+            continue
+        seen_file_ids.add(fid)
+        try:
+            downloaded.append(_download_file_entity(farm, fid, files_dir))
+        except Exception:
+            continue
+
+    logs = _fetch_logs_for_asset(farm, asset_id)
+    for i, log_item in enumerate(logs, start=1):
+        log_id = str(log_item.get("id", "")).strip()
+        log_attrs = log_item.get("attributes") or {}
+        log_name = str(log_attrs.get("name") or f"log_{i}")
+        log_bundle = str(log_item.get("type", "log--unknown")).split("--", 1)[-1]
+        base = f"{i:03d}_{_safe_name(log_bundle)}_{_safe_name(log_name)}_{log_id[:8]}"
+
+        with open(os.path.join(logs_dir, f"{base}.json"), "w", encoding="utf-8") as f:
+            json.dump(log_item, f, indent=2, ensure_ascii=False)
+
+        log_notes = _text_value(log_attrs.get("notes"))
+        if log_notes:
+            with open(os.path.join(logs_dir, f"{base}_notes.txt"), "w", encoding="utf-8") as f:
+                f.write(log_notes + "\n")
+
+        for fid in _collect_file_ids(log_item):
+            if fid in seen_file_ids:
+                continue
+            seen_file_ids.add(fid)
+            try:
+                downloaded.append(_download_file_entity(farm, fid, files_dir))
+            except Exception:
+                continue
+
+    return {
+        "asset_id": asset_id,
+        "asset_name": asset_name,
+        "export_dir": asset_dir,
+        "logs_found": len(logs),
+        "files_downloaded": len(downloaded),
+    }
+
+
 @mcp.tool()
 def get_server_info() -> str:
     farm = get_client()
@@ -1248,8 +1782,10 @@ def apply_segmented_image_geometry_to_asset(
 ) -> str:
     global LAST_ASSET_ID, LAST_ASSET_TYPE
     try:
+        coordinate_source = "user"
         if latitude is None or longitude is None:
             latitude, longitude = read_gps_coordinates()
+            coordinate_source = "GPS"
         farm = get_client()
         contour, area_px, width, height = extract_largest_red_contour(segmented_image_path)
         wkt = contour_to_wkt(contour, width, height, latitude, longitude, zoom)
@@ -1333,8 +1869,10 @@ def collect_data_with_coordinates(
     port = segment_server_port if segment_server_port > 0 else SEGMENT_SERVER_PORT
 
     try:
+        coordinate_source = "user"
         if latitude is None or longitude is None:
             latitude, longitude = read_gps_coordinates()
+            coordinate_source = "GPS"
 
         effective_mode = mode
         image_path = ""
@@ -1375,6 +1913,9 @@ def collect_data_with_coordinates(
             confidence=confidence,
             image_path=image_path,
             mode=effective_mode,
+            latitude=latitude,
+            longitude=longitude,
+            coordinate_source=coordinate_source,
         )
 
         if upsert_result["status"] == "needs_confirmation":
@@ -1451,6 +1992,395 @@ def collect_data_with_coordinates(
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
+
+
+@mcp.tool()
+def retrieve_plant_asset_data(
+    plant_name: str,
+    mode: str = "ask",
+    selected_asset_id: str = "",
+    selected_asset_name: str = "",
+    selected_asset_index: int = 0,
+    export_dir: str = "",
+) -> str:
+    """
+    Retrieve plant asset data from farmOS with a two-step flow:
+    1) mode='ask' => list matching plant assets and ask whether to export all or one.
+    2) mode='all' or mode='one' => export data.
+    """
+    mode = mode.strip().lower()
+    if mode not in {"ask", "all", "one"}:
+        return "Error: mode must be one of: ask, all, one."
+    if not plant_name.strip():
+        return "Error: plant_name is required."
+
+    try:
+        farm = get_client()
+        matches = _find_plant_assets_by_name(farm, plant_name=plant_name, limit=300)
+        if not matches:
+            return f"No plant assets found containing '{plant_name}'."
+        _cleanup_pending_export_requests()
+
+        base_export_dir = export_dir.strip() or PLANT_EXPORT_DIR
+        os.makedirs(base_export_dir, exist_ok=True)
+
+        if mode == "ask":
+            lines = [
+                f"Found {len(matches)} plant asset(s) matching '{plant_name}':",
+            ]
+            for idx, asset in enumerate(matches, start=1):
+                lines.append(_asset_summary_line(asset, idx))
+            lines.append("")
+            lines.append("Next step:")
+            lines.append("- For all assets: mode='all'")
+            lines.append(
+                "- For one asset: mode='one' + one selector: selected_asset_index=<number> OR selected_asset_name='<exact name>' OR selected_asset_id='<id>'"
+            )
+            lines.append(f"Export base directory: {base_export_dir}")
+            return "\n".join(lines)
+
+        targets = matches
+        if mode == "one":
+            chosen = None
+            if selected_asset_index > 0:
+                if selected_asset_index > len(matches):
+                    return (
+                        f"Error: selected_asset_index={selected_asset_index} is out of range. "
+                        f"Valid range is 1..{len(matches)}."
+                    )
+                chosen = matches[selected_asset_index - 1]
+            elif selected_asset_name.strip():
+                name_query = selected_asset_name.strip()
+                exact = [
+                    a for a in matches
+                    if str((a.get("attributes") or {}).get("name", "")).strip() == name_query
+                ]
+                if len(exact) == 1:
+                    chosen = exact[0]
+                elif len(exact) > 1:
+                    return (
+                        f"Error: selected_asset_name '{name_query}' matched multiple assets. "
+                        "Use selected_asset_index for an unambiguous choice."
+                    )
+                else:
+                    return (
+                        f"Error: selected_asset_name '{name_query}' is not in the match list for '{plant_name}'. "
+                        "Run with mode='ask' to list valid names."
+                    )
+            elif selected_asset_id.strip():
+                target_id = selected_asset_id.strip()
+                exact = [a for a in matches if str(a.get("id", "")).strip() == target_id]
+                if not exact:
+                    return (
+                        f"Error: selected_asset_id '{target_id}' is not in the match list for '{plant_name}'. "
+                        "Run with mode='ask' to list valid assets."
+                    )
+                chosen = exact[0]
+            else:
+                return (
+                    "Error: mode='one' requires one selector: selected_asset_index, selected_asset_name, or selected_asset_id."
+                )
+
+            targets = [chosen]
+
+        exported = []
+        for asset in targets:
+            exported.append(_export_single_asset_data(farm=farm, asset=asset, export_root=base_export_dir))
+
+        lines = [
+            f"Exported {len(exported)} asset(s) for plant query '{plant_name}'.",
+            f"Export base directory: {base_export_dir}",
+        ]
+        total_logs = 0
+        total_files = 0
+        for item in exported:
+            total_logs += item["logs_found"]
+            total_files += item["files_downloaded"]
+            lines.append(
+                f"- {item['asset_name']} ({item['asset_id']}): logs={item['logs_found']}, "
+                f"files={item['files_downloaded']}, path={item['export_dir']}"
+            )
+        lines.append(f"Totals: logs={total_logs}, files={total_files}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
+def cleanup_asset_activity_log_images(
+    mode: str = "scan",
+    asset_id: str = "",
+    asset_name_contains: str = "",
+    cleanup_scope: str = "both",
+    days_back: int = 30,
+    non_plant_conf_threshold: float = 25.0,
+    duplicate_hash_distance: int = 6,
+    keep_policy: str = "highest_confidence",
+    allow_multi_asset_execute: bool = False,
+    hard_delete_files: bool = False,
+    cleanup_local_captures: bool = False,
+    local_capture_dir: str = "",
+    confirmation_text: str = "",
+) -> str:
+    """
+    Cleans images attached to activity logs for target plant assets.
+    Workflow:
+    1) YOLO filter first (plant vs non-plant).
+    2) pHash duplicate detection only among images YOLO classified as plant.
+    3) scan mode reports candidates; execute mode deletes candidate file entities.
+    """
+    mode = mode.strip().lower()
+    if mode not in {"scan", "execute"}:
+        return "Error: mode must be 'scan' or 'execute'."
+
+    scope = cleanup_scope.strip().lower()
+    if scope not in {"non_plant", "duplicates", "both"}:
+        return "Error: cleanup_scope must be one of: non_plant, duplicates, both."
+
+    keep_policy = keep_policy.strip().lower()
+    if keep_policy not in {"highest_confidence", "newest", "oldest"}:
+        return "Error: keep_policy must be one of: highest_confidence, newest, oldest."
+
+    if not asset_id.strip() and not asset_name_contains.strip():
+        return "Error: Provide either asset_id or asset_name_contains."
+
+    try:
+        farm = get_client()
+
+        targets = []
+        if asset_id.strip():
+            asset = find_asset_by_id(farm, asset_id.strip())
+            if not asset:
+                return f"Error: Asset not found for id {asset_id.strip()}."
+            targets = [asset]
+        else:
+            targets = _find_plant_assets_by_name(farm, plant_name=asset_name_contains.strip(), limit=500)
+            if not targets:
+                return f"No plant assets found containing '{asset_name_contains.strip()}'."
+            if mode == "scan" and len(targets) > 1:
+                lines = [
+                    f"Found {len(targets)} plant asset(s) matching '{asset_name_contains.strip()}':"
+                ]
+                for idx, asset in enumerate(targets, start=1):
+                    lines.append(_asset_summary_line(asset, idx))
+                lines.append("")
+                lines.append("Selection required before image cleanup scan:")
+                lines.append("- Rerun cleanup_asset_activity_log_images with asset_id='<chosen id>'")
+                lines.append("- This avoids mixing multiple similarly named assets in one scan.")
+                return "\n".join(lines)
+
+        temp_dir = os.path.join(
+            CAPTURE_DIR,
+            f"cleanup_tmp_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+        os.makedirs(temp_dir, exist_ok=True)
+
+        file_records = {}
+        scanned_logs = 0
+        scanned_images = 0
+        yolo_errors = 0
+        log_by_id = {}
+
+        for asset in targets:
+            aid = str(asset.get("id", "")).strip()
+            logs = _fetch_activity_logs_for_asset(farm, aid, days_back=days_back)
+            for log_item in logs:
+                scanned_logs += 1
+                log_id = str(log_item.get("id", "")).strip()
+                if log_id:
+                    log_by_id[log_id] = log_item
+                ts = _parse_iso_datetime((log_item.get("attributes") or {}).get("timestamp"))
+                order_key = ts.timestamp() if ts else time.time()
+
+                for fid in _collect_image_file_ids(log_item):
+                    scanned_images += 1
+                    if fid not in file_records:
+                        file_records[fid] = {
+                            "file_id": fid,
+                            "asset_id": aid,
+                            "log_ids": set(),
+                            "order_key": float(order_key),
+                            "is_plant": False,
+                            "label": "",
+                            "confidence": 0.0,
+                            "yolo_error": "",
+                            "phash": None,
+                        }
+                    file_records[fid]["log_ids"].add(log_id)
+                    # Keep the newest timestamp encountered for deterministic newest/oldest behavior.
+                    file_records[fid]["order_key"] = max(float(file_records[fid]["order_key"]), float(order_key))
+
+        if not file_records:
+            return "No activity-log images found in the selected scope."
+
+        for fid, rec in file_records.items():
+            local_path = _download_file_entity(farm, fid, temp_dir)
+            is_plant, label, confidence, err = _is_plant_image_by_yolo(local_path, non_plant_conf_threshold)
+            rec["is_plant"] = is_plant
+            rec["label"] = label
+            rec["confidence"] = confidence
+            rec["yolo_error"] = err
+            if err:
+                yolo_errors += 1
+            if is_plant:
+                rec["phash"] = _compute_phash(local_path)
+
+        non_plant_candidates = [
+            rec for rec in file_records.values()
+            if not rec["is_plant"]
+        ]
+
+        plant_records = [
+            rec for rec in file_records.values()
+            if rec["is_plant"] and rec["phash"] is not None
+        ]
+        dup_groups_idx = _group_duplicates(plant_records, max_distance=max(0, int(duplicate_hash_distance)))
+        duplicate_candidates = []
+        duplicate_kept = []
+        for idxs in dup_groups_idx:
+            keep_idx = _choose_keep_index(plant_records, idxs, keep_policy=keep_policy)
+            duplicate_kept.append(plant_records[keep_idx]["file_id"])
+            for i in idxs:
+                if i == keep_idx:
+                    continue
+                duplicate_candidates.append(plant_records[i])
+
+        to_delete = {}
+        if scope in {"non_plant", "both"}:
+            for rec in non_plant_candidates:
+                to_delete[rec["file_id"]] = rec
+        if scope in {"duplicates", "both"}:
+            for rec in duplicate_candidates:
+                to_delete[rec["file_id"]] = rec
+
+        candidate_ids = sorted(to_delete.keys())
+        lines = [
+            f"Mode: {mode}",
+            f"Assets scanned: {len(targets)}",
+            f"Activity logs scanned: {scanned_logs}",
+            f"Images scanned: {scanned_images}",
+            f"YOLO plant confidence threshold: {non_plant_conf_threshold:.2f}%",
+            f"Duplicate pHash distance threshold: {max(0, int(duplicate_hash_distance))}",
+            f"Plant images considered for duplicate check: {len(plant_records)}",
+            f"Non-plant candidates: {len(non_plant_candidates)}",
+            f"Duplicate groups found: {len(dup_groups_idx)}",
+            f"Duplicate candidates to remove: {len(duplicate_candidates)}",
+            f"Total delete candidates (scope={scope}): {len(candidate_ids)}",
+        ]
+        if yolo_errors:
+            lines.append(f"YOLO errors treated as non-plant: {yolo_errors}")
+
+        if duplicate_kept:
+            preview_keep = ", ".join(duplicate_kept[:15])
+            if len(duplicate_kept) > 15:
+                preview_keep += ", ..."
+            lines.append(f"Duplicate keep set ({keep_policy}): {preview_keep}")
+
+        if candidate_ids:
+            preview_ids = ", ".join(candidate_ids[:30])
+            if len(candidate_ids) > 30:
+                preview_ids += ", ..."
+            lines.append(f"Candidate file IDs: {preview_ids}")
+
+        if mode == "scan":
+            lines.append("No deletions performed (scan mode).")
+            lines.append("To execute, rerun with mode='execute' and confirmation_text='DELETE CONFIRMED'.")
+            return "\n".join(lines)
+
+        if len(targets) > 1 and not allow_multi_asset_execute:
+            lines.append(
+                "Execution blocked: multiple assets matched. Use asset_id for one asset, "
+                "or set allow_multi_asset_execute=true intentionally."
+            )
+            return "\n".join(lines)
+
+        if confirmation_text.strip() != "DELETE CONFIRMED":
+            lines.append("Execution blocked: confirmation_text must be exactly 'DELETE CONFIRMED'.")
+            return "\n".join(lines)
+
+        deleted = 0
+        unlinked_refs = 0
+        unlink_failures = []
+        failed = []
+        local_deleted_files = 0
+        local_delete_failures = []
+        capture_dir = local_capture_dir.strip() or CAPTURE_DIR
+
+        # Unlink phase: apply one update per log to avoid stale relationship snapshots
+        # when multiple candidate files belong to the same log.
+        remove_by_log = {}
+        for fid in candidate_ids:
+            rec = to_delete.get(fid) or {}
+            for log_id in rec.get("log_ids", []):
+                if not log_id:
+                    continue
+                remove_by_log.setdefault(log_id, set()).add(fid)
+
+        for log_id, remove_ids in remove_by_log.items():
+            log_item = log_by_id.get(log_id)
+            if not log_item:
+                # Fallback fetch in case cache is missing.
+                try:
+                    fetched = farm.log.get_id("activity", log_id)
+                    log_item = (fetched or {}).get("data")
+                except Exception:
+                    log_item = None
+            if not log_item:
+                for fid in sorted(remove_ids):
+                    unlink_failures.append(f"{fid}@{log_id}: activity log not found.")
+                continue
+
+            removed_count, unlink_err = _unlink_images_from_activity_log(farm, log_item, remove_ids)
+            if unlink_err:
+                for fid in sorted(remove_ids):
+                    unlink_failures.append(f"{fid}@{log_id}: {unlink_err}")
+            else:
+                unlinked_refs += int(removed_count)
+
+        for fid in candidate_ids:
+            if cleanup_local_captures:
+                original_name = _fetch_file_entity_filename(farm, fid)
+                removed_count, local_errs = _delete_local_capture_files_by_filename(capture_dir, original_name)
+                local_deleted_files += removed_count
+                local_delete_failures.extend(local_errs)
+
+            if hard_delete_files:
+                ok, err = _delete_file_entity(farm, fid)
+                if ok:
+                    deleted += 1
+                else:
+                    failed.append(f"{fid}: {err}")
+
+        lines.append(f"Unlinked image references from activity logs: {unlinked_refs}")
+        lines.append(f"Unlink failures: {len(unlink_failures)}")
+        if unlink_failures:
+            preview_unlink_failed = " | ".join(unlink_failures[:10])
+            if len(unlink_failures) > 10:
+                preview_unlink_failed += " | ..."
+            lines.append(f"Unlink failure details: {preview_unlink_failed}")
+
+        if hard_delete_files:
+            lines.append(f"Deleted file entities: {deleted}")
+            lines.append(f"Delete failures: {len(failed)}")
+            if failed:
+                preview_failed = " | ".join(failed[:10])
+                if len(failed) > 10:
+                    preview_failed += " | ..."
+                lines.append(f"Failures: {preview_failed}")
+        else:
+            lines.append("File-entity deletion skipped (hard_delete_files=false).")
+
+        if cleanup_local_captures:
+            lines.append(f"Local capture files deleted by filename match: {local_deleted_files}")
+            lines.append(f"Local delete failures: {len(local_delete_failures)}")
+            if local_delete_failures:
+                preview_local_failed = " | ".join(local_delete_failures[:10])
+                if len(local_delete_failures) > 10:
+                    preview_local_failed += " | ..."
+                lines.append(f"Local delete failure details: {preview_local_failed}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 if __name__ == "__main__":
