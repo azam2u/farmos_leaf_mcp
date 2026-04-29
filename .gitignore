@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Runtime output artifacts
+captures/
+mapbox_inputs/
+received_segmented_mapbox_image/
+plant_exports/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
