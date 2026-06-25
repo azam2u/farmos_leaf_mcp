@@ -51,6 +51,9 @@ UI_PREVIEW_PATH = os.environ.get("LEAF_UI_PREVIEW_PATH", "").strip()
 UI_PREVIEW_INTERVAL_SECONDS = float(
     os.environ.get("LEAF_UI_PREVIEW_INTERVAL_SECONDS", "0.15")
 )
+UI_PREVIEW_JPEG_QUALITY = max(
+    40, min(95, int(os.environ.get("LEAF_UI_PREVIEW_JPEG_QUALITY", "75")))
+)
 CAPTURE_DIR = os.environ.get("LEAF_CAPTURE_DIR", os.path.join(SCRIPT_DIR, "captures"))
 NOTES_HTML_FORMAT = os.environ.get("LEAF_NOTES_HTML_FORMAT", "default").strip() or "default"
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
@@ -256,6 +259,7 @@ def _open_camera(camera_index: int):
         cap.release()
         cap = cv2.VideoCapture(camera_index)
     if cap.isOpened():
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
     cap.release()
@@ -265,6 +269,7 @@ def _open_camera(camera_index: int):
         cap.release()
         cap = cv2.VideoCapture(device_path)
     if cap.isOpened():
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
     cap.release()
@@ -280,7 +285,11 @@ def _publish_ui_preview(frame, last_publish_ts: float) -> float:
     output_path = os.path.abspath(UI_PREVIEW_PATH)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     temporary_path = output_path + ".tmp.jpg"
-    if cv2.imwrite(temporary_path, frame):
+    if cv2.imwrite(
+        temporary_path,
+        frame,
+        [cv2.IMWRITE_JPEG_QUALITY, UI_PREVIEW_JPEG_QUALITY],
+    ):
         os.replace(temporary_path, output_path)
         return now
     return last_publish_ts

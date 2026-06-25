@@ -84,6 +84,8 @@ class CollectorSupervisor:
                     "AUTO_CONTROL_FILE": str(CONTROL_FILE),
                     "AUTO_RUNTIME_STATUS_FILE": str(RUNTIME_STATUS_FILE),
                     "LEAF_UI_PREVIEW_PATH": str(PREVIEW_FILE),
+                    "LEAF_UI_PREVIEW_INTERVAL_SECONDS": "0.10",
+                    "LEAF_UI_PREVIEW_JPEG_QUALITY": "75",
                     "LEAF_CAPTURE_LIVE_INFERENCE": "0",
                     "LEAF_YOLO_LIVE_PREVIEW_ON_ASK": "0",
                     "PYTHONUNBUFFERED": "1",

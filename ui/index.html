@@ -285,6 +285,8 @@
     let lastLogId = 0;
     let bootDismissed = false;
     let healthReady = false;
+    let previewAvailable = false;
+    let previewLoading = false;
 
     async function post(action) {
       const response = await fetch(`/api/control/${action}`, {method: "POST"});
@@ -382,8 +384,8 @@
         renderJobs(data.jobs);
         const preview = document.getElementById("preview");
         const empty = document.getElementById("previewEmpty");
+        previewAvailable = data.preview_available;
         if (data.preview_available) {
-          preview.src = `/api/preview?t=${Date.now()}`;
           preview.hidden = false;
           empty.hidden = true;
         } else {
@@ -409,6 +411,20 @@
       } catch (_) {}
     }
 
+    function refreshPreview() {
+      if (!previewAvailable || previewLoading || document.hidden) return;
+      previewLoading = true;
+      const nextFrame = new Image();
+      nextFrame.onload = () => {
+        document.getElementById("preview").src = nextFrame.src;
+        previewLoading = false;
+      };
+      nextFrame.onerror = () => {
+        previewLoading = false;
+      };
+      nextFrame.src = `/api/preview?t=${Date.now()}`;
+    }
+
     document.getElementById("startBtn").onclick = () => post("start");
     document.getElementById("pauseBtn").onclick = () => {
       const paused = document.getElementById("stateText").textContent.toLowerCase() === "paused";
@@ -424,6 +440,7 @@
     refreshLogs();
     setInterval(refresh, 1000);
     setInterval(refreshLogs, 500);
+    setInterval(refreshPreview, 125);
   </script>
 </body>
 </html>
