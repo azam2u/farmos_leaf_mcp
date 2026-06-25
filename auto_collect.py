@@ -221,9 +221,43 @@ def read_control_command(control_file: str) -> str:
         return "run"
 
 
-def controlled_wait(seconds: float, control_file: str) -> str:
+def write_runtime_status(
+    status_file: str,
+    phase: str,
+    message: str,
+    countdown_seconds: Optional[int] = None,
+    job_id: str = "",
+):
+    if not status_file:
+        return
+    path = os.path.abspath(status_file)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "phase": phase,
+        "message": message,
+        "countdown_seconds": countdown_seconds,
+        "job_id": job_id,
+        "updated_at": time.time(),
+    }
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream)
+    os.replace(temporary, path)
+
+
+def controlled_wait(seconds: float, control_file: str, status_file: str) -> str:
     end_time = time.monotonic() + max(0.0, seconds)
+    last_countdown = None
     while time.monotonic() < end_time:
+        remaining = max(0, math.ceil(end_time - time.monotonic()))
+        if remaining != last_countdown:
+            write_runtime_status(
+                status_file,
+                phase="waiting",
+                message="Waiting for the next coordinate check",
+                countdown_seconds=remaining,
+            )
+            last_countdown = remaining
         command = read_control_command(control_file)
         if command in {"pause", "stop"}:
             return command
@@ -288,6 +322,7 @@ def main() -> int:
     )
     poll_seconds = max(0.1, configured_poll_seconds)
     control_file = os.environ.get("AUTO_CONTROL_FILE", "").strip()
+    status_file = os.environ.get("AUTO_RUNTIME_STATUS_FILE", "").strip()
     source = make_coordinate_source(args.dummy_move_meters)
     coordinate_source_name = os.environ.get("AUTO_COORDINATE_SOURCE", "dummy").strip().lower()
     stop_requested = False
@@ -312,6 +347,11 @@ def main() -> int:
         f"minimum_movement={minimum_movement:.2f}m, poll={poll_seconds:.1f}s, "
         f"dry_run={args.dry_run}"
     )
+    write_runtime_status(
+        status_file,
+        phase="ready",
+        message="Collector started and is ready",
+    )
 
     while not stop_requested:
         command = read_control_command(control_file)
@@ -320,6 +360,11 @@ def main() -> int:
             break
         if command == "pause":
             print("Automatic collection paused.")
+            write_runtime_status(
+                status_file,
+                phase="paused",
+                message="Collection is paused",
+            )
             while not stop_requested:
                 command = read_control_command(control_file)
                 if command == "stop":
@@ -327,6 +372,11 @@ def main() -> int:
                     break
                 if command == "run":
                     print("Automatic collection resumed.")
+                    write_runtime_status(
+                        status_file,
+                        phase="ready",
+                        message="Collection resumed",
+                    )
                     break
                 time.sleep(0.25)
             if stop_requested:
@@ -358,6 +408,11 @@ def main() -> int:
             if args.dry_run:
                 result = "Dry run: pipeline skipped."
             else:
+                write_runtime_status(
+                    status_file,
+                    phase="foreground",
+                    message="Capturing identification and data images",
+                )
                 job_id, error = run_foreground_capture(
                     store=store,
                     coordinate=coordinate,
@@ -369,6 +424,20 @@ def main() -> int:
                     else f"Error: Job {job_id} foreground failed: {error}"
                 )
                 print(result)
+                if not error:
+                    write_runtime_status(
+                        status_file,
+                        phase="queued",
+                        message="Foreground complete; background processing queued",
+                        job_id=job_id,
+                    )
+                else:
+                    write_runtime_status(
+                        status_file,
+                        phase="error",
+                        message=f"Foreground failed: {error}",
+                        job_id=job_id,
+                    )
 
             if not result.startswith("Error:"):
                 last_run_coordinate = coordinate
@@ -387,15 +456,25 @@ def main() -> int:
         if args.max_checks > 0 and coordinate_checks >= args.max_checks:
             break
         if not stop_requested:
-            command = controlled_wait(poll_seconds, control_file)
+            command = controlled_wait(poll_seconds, control_file, status_file)
             if command == "stop":
                 stop_requested = True
 
     if worker:
+        write_runtime_status(
+            status_file,
+            phase="stopping",
+            message="Waiting for background jobs to finish",
+        )
         print("Foreground collection stopped; waiting for background jobs to finish...")
         worker.stop_when_idle()
     fcntl.flock(runner_lock.fileno(), fcntl.LOCK_UN)
     runner_lock.close()
+    write_runtime_status(
+        status_file,
+        phase="stopped",
+        message="Automatic collection stopped",
+    )
     print("Automatic collection stopped.")
     return 0
 

@@ -73,10 +73,18 @@
     .layout {
       display: grid;
       grid-template-columns: minmax(430px, 1.1fr) minmax(360px, .9fr);
+      grid-template-areas:
+        "preview logs"
+        "health jobs";
       gap: 18px;
       align-items: start;
     }
+    .preview-panel { grid-area: preview; }
+    .logs-panel { grid-area: logs; }
+    .health-panel { grid-area: health; }
+    .jobs-panel { grid-area: jobs; }
     .section {
+      min-width: 0;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: var(--surface);
@@ -89,9 +97,12 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
       font-size: 14px;
       font-weight: 650;
     }
+    .section-header span:first-child { min-width: 0; }
+    .section-header span:last-child { flex: 0 0 auto; }
     .preview {
       width: 100%;
       aspect-ratio: 4 / 3;
@@ -99,6 +110,32 @@
       background: #080b09;
       object-fit: contain;
       display: block;
+    }
+    .preview-wrap {
+      position: relative;
+      background: #080b09;
+    }
+    .countdown {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      min-width: 210px;
+      padding: 12px 14px;
+      border: 1px solid #52645a;
+      border-radius: 6px;
+      background: rgba(13, 18, 15, .9);
+      backdrop-filter: blur(4px);
+    }
+    .countdown strong {
+      display: block;
+      font-size: 30px;
+      line-height: 1;
+      color: var(--green);
+      margin-bottom: 5px;
+    }
+    .countdown span {
+      color: var(--muted);
+      font-size: 12px;
     }
     .preview-empty {
       width: 100%;
@@ -140,7 +177,7 @@
     .job-id { font-family: "DejaVu Sans Mono", monospace; color: var(--cyan); }
     .job-stage, .job-plant { color: var(--muted); }
     .logs {
-      height: 280px;
+      height: 420px;
       overflow: auto;
       padding: 10px 12px;
       margin: 0;
@@ -175,7 +212,14 @@
     @media (max-width: 900px) {
       main { padding: 12px; }
       .topbar { padding: 12px 14px; }
-      .layout { grid-template-columns: 1fr; }
+      .layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "preview"
+          "logs"
+          "health"
+          "jobs";
+      }
       .health-grid { grid-template-columns: 1fr; }
       .controls { flex-wrap: wrap; padding-bottom: 12px; }
       .btn.secondary { margin-left: 0; }
@@ -208,30 +252,32 @@
     </div>
 
     <div class="layout">
-      <div>
-        <section class="section">
-          <div class="section-header"><span>YOLO Camera Preview</span><span id="previewStatus">Waiting</span></div>
+      <section class="section preview-panel">
+        <div class="section-header"><span>YOLO Camera Preview</span><span id="previewStatus">Waiting</span></div>
+        <div class="preview-wrap">
           <div id="previewEmpty" class="preview-empty">Press Start to begin camera collection</div>
           <img id="preview" class="preview" alt="YOLO camera preview" hidden>
-        </section>
+          <div id="countdown" class="countdown" hidden>
+            <strong id="countdownValue">10s</strong>
+            <span id="countdownLabel">Waiting for the next coordinate check</span>
+          </div>
+        </div>
+      </section>
 
-        <section class="section" style="margin-top:18px">
-          <div class="section-header"><span>System Preflight</span><span id="healthTime"></span></div>
-          <div id="healthGrid" class="health-grid"></div>
-        </section>
-      </div>
+      <section class="section logs-panel">
+        <div class="section-header"><span>Live Logs</span><span id="logState">Idle</span></div>
+        <pre id="logs" class="logs"></pre>
+      </section>
 
-      <div>
-        <section class="section">
-          <div class="section-header"><span>Collection Jobs</span><span id="jobCount">0</span></div>
-          <div id="jobs" class="jobs"></div>
-        </section>
+      <section class="section health-panel">
+        <div class="section-header"><span>System Preflight</span><span id="healthTime"></span></div>
+        <div id="healthGrid" class="health-grid"></div>
+      </section>
 
-        <section class="section" style="margin-top:18px">
-          <div class="section-header"><span>Live Logs</span><span id="logState">Idle</span></div>
-          <pre id="logs" class="logs"></pre>
-        </section>
-      </div>
+      <section class="section jobs-panel">
+        <div class="section-header"><span>Collection Jobs</span><span id="jobCount">0</span></div>
+        <div id="jobs" class="jobs"></div>
+      </section>
     </div>
   </main>
 
@@ -288,6 +334,27 @@
       }
     }
 
+    function renderRuntime(runtime, collector) {
+      const countdown = document.getElementById("countdown");
+      const value = document.getElementById("countdownValue");
+      const label = document.getElementById("countdownLabel");
+      const previewStatus = document.getElementById("previewStatus");
+      const phase = runtime.phase || collector.state;
+      if (phase === "waiting" && Number.isFinite(runtime.countdown_seconds)) {
+        countdown.hidden = false;
+        value.textContent = `${runtime.countdown_seconds}s`;
+        label.textContent = runtime.message || "Waiting for the next coordinate check";
+        previewStatus.textContent = "Next collection";
+      } else {
+        countdown.hidden = true;
+        if (phase === "foreground") previewStatus.textContent = "Capturing";
+        else if (phase === "queued") previewStatus.textContent = "Background queued";
+        else if (phase === "paused") previewStatus.textContent = "Paused";
+        else if (collector.state === "stopped") previewStatus.textContent = "Waiting";
+        else previewStatus.textContent = "Live";
+      }
+    }
+
     function renderJobs(jobs) {
       const root = document.getElementById("jobs");
       root.innerHTML = "";
@@ -310,6 +377,7 @@
         const response = await fetch("/api/status", {cache: "no-store"});
         const data = await response.json();
         renderCollector(data.collector);
+        renderRuntime(data.runtime || {}, data.collector);
         renderHealth(data.health);
         renderJobs(data.jobs);
         const preview = document.getElementById("preview");
@@ -318,9 +386,10 @@
           preview.src = `/api/preview?t=${Date.now()}`;
           preview.hidden = false;
           empty.hidden = true;
-          document.getElementById("previewStatus").textContent = "Live";
         } else {
-          document.getElementById("previewStatus").textContent = "Waiting";
+          if (data.collector.state === "stopped") {
+            document.getElementById("previewStatus").textContent = "Waiting";
+          }
         }
       } catch (error) {
         appendLocal(`Dashboard status error: ${error}`);

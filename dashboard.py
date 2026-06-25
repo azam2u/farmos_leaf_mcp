@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = ROOT / "collection_jobs" / "dashboard"
 CONTROL_FILE = RUNTIME_DIR / "control.json"
 PREVIEW_FILE = RUNTIME_DIR / "preview.jpg"
+RUNTIME_STATUS_FILE = RUNTIME_DIR / "collector_status.json"
 DATABASE_PATH = Path(
     os.environ.get("AUTO_JOB_DATABASE", ROOT / "collection_jobs" / "jobs.sqlite3")
 )
@@ -80,6 +81,7 @@ class CollectorSupervisor:
             environment.update(
                 {
                     "AUTO_CONTROL_FILE": str(CONTROL_FILE),
+                    "AUTO_RUNTIME_STATUS_FILE": str(RUNTIME_STATUS_FILE),
                     "LEAF_UI_PREVIEW_PATH": str(PREVIEW_FILE),
                     "LEAF_CAPTURE_LIVE_INFERENCE": "0",
                     "PYTHONUNBUFFERED": "1",
@@ -373,9 +375,22 @@ async def homepage(_request):
 async def status_api(_request):
     store = CollectionJobStore(str(DATABASE_PATH))
     jobs = store.list(limit=12)
+    collector = supervisor.status()
+    runtime = {}
+    try:
+        runtime = json.loads(RUNTIME_STATUS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    if collector["state"] == "stopped":
+        runtime = {
+            "phase": "stopped",
+            "message": "Automatic collection stopped",
+            "countdown_seconds": None,
+        }
     return JSONResponse(
         {
-            "collector": supervisor.status(),
+            "collector": collector,
+            "runtime": runtime,
             "health": health.state(),
             "jobs": jobs,
             "preview_available": PREVIEW_FILE.is_file(),
