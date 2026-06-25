@@ -4,6 +4,7 @@ import collections
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -84,11 +85,12 @@ class CollectorSupervisor:
                     "AUTO_RUNTIME_STATUS_FILE": str(RUNTIME_STATUS_FILE),
                     "LEAF_UI_PREVIEW_PATH": str(PREVIEW_FILE),
                     "LEAF_CAPTURE_LIVE_INFERENCE": "0",
+                    "LEAF_YOLO_LIVE_PREVIEW_ON_ASK": "0",
                     "PYTHONUNBUFFERED": "1",
                 }
             )
             process = subprocess.Popen(
-                [str(ROOT / "run_auto_collect.sh")],
+                [sys.executable, str(ROOT / "auto_collect.py")],
                 cwd=ROOT,
                 env=environment,
                 stdout=subprocess.PIPE,
