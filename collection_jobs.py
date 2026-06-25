@@ -226,18 +226,29 @@ def upload_job_images(job: dict, asset_id: str, asset_type: str) -> dict:
     return {"log_id": log_id, "uploaded": uploaded}
 
 
-def process_collection_job(store: CollectionJobStore, job: dict):
+def process_collection_job(store: CollectionJobStore, job: dict, log=print):
     import farmos_leaf_mcp as app
 
     job_id = job["job_id"]
     try:
+        yolo_label = job["predicted_label"] or "unknown"
+        confidence = float(job["confidence"])
+        log(
+            f"Job {job_id}: background review started. "
+            f"YOLO={yolo_label} ({confidence:.2f}%)."
+        )
+        if confidence < app.LOW_CONF_THRESHOLD_PERCENT:
+            log(
+                f"Job {job_id}: requesting LLM votes because confidence is below "
+                f"{app.LOW_CONF_THRESHOLD_PERCENT:.2f}%."
+            )
         farm = app.get_client()
-        asset_name = app.normalize_asset_name(job["predicted_label"])
+        asset_name = app.normalize_asset_name(yolo_label)
         upsert = app.upsert_plant_asset(
             farm=farm,
             asset_name=asset_name,
-            predicted_label=job["predicted_label"],
-            confidence=float(job["confidence"]),
+            predicted_label=yolo_label,
+            confidence=confidence,
             image_path=job["identification_image"],
             mode="create_new",
             latitude=float(job["latitude"]),
@@ -247,12 +258,17 @@ def process_collection_job(store: CollectionJobStore, job: dict):
         )
         asset_id = upsert["asset_id"]
         asset_type = upsert.get("asset_type", "asset--plant")
+        final_asset_name = upsert.get("asset_name", asset_name)
         store.update(
             job_id,
             stage="background_postprocess",
             asset_id=asset_id,
-            asset_name=upsert.get("asset_name", asset_name),
+            asset_name=final_asset_name,
             result_message=upsert["message"],
+        )
+        log(
+            f"Job {job_id}: final asset name='{final_asset_name}' "
+            f"(YOLO label='{yolo_label}', asset_id={asset_id})."
         )
 
         results = {"images": None, "geometry": None}
@@ -319,6 +335,15 @@ def process_collection_job(store: CollectionJobStore, job: dict):
             messages.append("Warnings: " + " | ".join(errors))
         update_fields["result_message"] = "\n".join(messages)
         store.update(job_id, **update_fields)
+        completion = (
+            "completed"
+            if not errors
+            else f"completed with warnings: {' | '.join(errors)}"
+        )
+        log(
+            f"Job {job_id}: {completion}. "
+            f"Final asset='{final_asset_name}', YOLO='{yolo_label}'."
+        )
     except Exception as exc:
         store.update(
             job_id,
@@ -327,12 +352,19 @@ def process_collection_job(store: CollectionJobStore, job: dict):
             error_message=str(exc),
             result_message=f"Background processing failed: {exc}",
         )
+        log(f"Job {job_id}: background processing failed: {exc}")
 
 
 class CollectionJobWorker:
-    def __init__(self, store: CollectionJobStore, poll_seconds: float = 0.5):
+    def __init__(
+        self,
+        store: CollectionJobStore,
+        poll_seconds: float = 0.5,
+        log=print,
+    ):
         self.store = store
         self.poll_seconds = max(0.1, poll_seconds)
+        self.log = log
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -352,7 +384,7 @@ class CollectionJobWorker:
         while True:
             job = self.store.claim_next()
             if job:
-                process_collection_job(self.store, job)
+                process_collection_job(self.store, job, log=self.log)
                 continue
             if self._stop.is_set():
                 return
