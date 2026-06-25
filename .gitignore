@@ -15,6 +15,7 @@ captures/
 mapbox_inputs/
 received_segmented_mapbox_image/
 plant_exports/
+collection_jobs/
 
 # OS/editor
 .DS_Store

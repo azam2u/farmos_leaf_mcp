@@ -18,6 +18,8 @@ MCP server for plant-facing farmOS workflows:
 5. `collect_data_with_coordinates(latitude=None, longitude=None, mode="ask", asset_name_override="", camera_index=0, classifier_delay_seconds=5.0, collection_interval_seconds=3.0, collection_duration_seconds=15.0, mapbox_zoom=18, mapbox_width=800, mapbox_height=800, segment_server_host="", segment_server_port=0, upload_to_activity_log=False)`
 6. `retrieve_plant_asset_data(plant_name, mode="ask", selected_asset_id="", selected_asset_name="", selected_asset_index=0, export_dir="")`
 7. `cleanup_asset_activity_log_images(mode="scan", asset_id="", asset_name_contains="", cleanup_scope="both", days_back=30, non_plant_conf_threshold=25.0, duplicate_hash_distance=6, keep_policy="highest_confidence", allow_multi_asset_execute=False, hard_delete_files=False, cleanup_local_captures=False, local_capture_dir="", confirmation_text="")`
+8. `get_collection_job_status(job_id)`
+9. `list_collection_jobs(limit=20)`
 
 ## Architecture
 
@@ -73,6 +75,90 @@ This script:
 - activates venv (if present)
 - loads `.env` (if present)
 - starts `farmos_leaf_mcp.py`
+
+## Automatic Collection
+
+Run the complete pipeline continuously without Roo or an MCP prompt:
+
+```bash
+./run_auto_collect.sh
+```
+
+The automatic runner uses a foreground/background job architecture:
+
+1. reads a coordinate
+2. creates and prints a durable job ID
+3. foreground: shows YOLO identification for `AUTO_CLASSIFIER_DELAY_SECONDS`
+4. foreground: captures all timed data images
+5. queues the job and waits `AUTO_POLL_SECONDS` (default 10 seconds)
+6. background: performs remote LLM review and creates the farmOS asset
+7. background: uploads captured images and updates segmented geometry in parallel
+8. reads the next coordinate and starts another foreground job only after moving at least `AUTO_MIN_MOVEMENT_METERS`
+
+It uses `mode="create_new"` so no live-preview confirmation or overwrite prompt is required.
+Foreground collection can continue while earlier jobs finish remotely. Background jobs are
+processed serially and stored in `AUTO_JOB_DATABASE`. Stop with `Ctrl+C`; the runner waits
+for queued background jobs before exiting.
+
+Current dummy-coordinate defaults simulate 1.2 meters of northward movement per check:
+
+```text
+AUTO_COORDINATE_SOURCE=dummy
+AUTO_DUMMY_LATITUDE=35.009445
+AUTO_DUMMY_LONGITUDE=135.718787
+AUTO_DUMMY_MOVE_METERS_PER_CHECK=1.2
+```
+
+Set `AUTO_DUMMY_MOVE_METERS_PER_CHECK=0` to simulate a stationary device. To
+use the real NMEA GPS later:
+
+```text
+AUTO_COORDINATE_SOURCE=gps
+GPS_DEVICE=/dev/ttyACM0
+```
+
+Safe movement-only test, with no camera or farmOS changes:
+
+```bash
+./run_auto_collect.sh --dry-run --max-checks 3 --poll-seconds 0.1
+```
+
+Stationary dummy-coordinate test:
+
+```bash
+./run_auto_collect.sh --dry-run --max-checks 3 \
+  --poll-seconds 0.1 --dummy-move-meters 0
+```
+
+Run exactly one real collection:
+
+```bash
+./run_auto_collect.sh --max-runs 1
+```
+
+List recent jobs:
+
+```bash
+./run_auto_collect.sh --list-jobs
+```
+
+Check one job:
+
+```bash
+./run_auto_collect.sh --status JOB_ID
+```
+
+Job stages include:
+
+- `gps_trigger`
+- `foreground_data_capture`
+- `background_queued`
+- `background_asset`
+- `background_postprocess`
+- `completed`, `completed_with_warnings`, or `failed`
+
+The same status is available to MCP clients through `get_collection_job_status`
+and `list_collection_jobs`.
 
 ## Tool Behavior Notes
 

@@ -11,7 +11,7 @@ if [ -f .env ]; then
   set +a
 fi
 
-VENV_PATH="${FARMOS_LEAF_VENV_PATH:-/home/cvl/farmos_mcp/farmos-venv}"
+VENV_PATH="${FARMOS_LEAF_VENV_PATH:-$PWD/.venv}"
 if [ -f "$VENV_PATH/bin/activate" ]; then
   # shellcheck disable=SC1091
   source "$VENV_PATH/bin/activate"

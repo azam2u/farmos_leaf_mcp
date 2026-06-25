@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import datetime
+import fcntl
 import glob
 import html
 import json
@@ -42,6 +43,10 @@ YOLO_CONFIDENCE = float(os.environ.get("LEAF_YOLO_CONFIDENCE", "0.25"))
 YOLO_LIVE_PREVIEW_ON_ASK = os.environ.get("LEAF_YOLO_LIVE_PREVIEW_ON_ASK", "1").strip().lower() not in {"0", "false", "no"}
 CAPTURE_LIVE_INFERENCE = os.environ.get("LEAF_CAPTURE_LIVE_INFERENCE", "1").strip().lower() not in {"0", "false", "no"}
 CAPTURE_LIVE_WINDOW_TITLE = os.environ.get("LEAF_CAPTURE_LIVE_WINDOW_TITLE", "FarmOS Capture Live Inference")
+IDENTIFICATION_WINDOW_TITLE = os.environ.get(
+    "LEAF_IDENTIFICATION_WINDOW_TITLE",
+    "FarmOS Identification Preview",
+)
 CAPTURE_DIR = os.environ.get("LEAF_CAPTURE_DIR", os.path.join(SCRIPT_DIR, "captures"))
 NOTES_HTML_FORMAT = os.environ.get("LEAF_NOTES_HTML_FORMAT", "default").strip() or "default"
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
@@ -54,8 +59,10 @@ MAPBOX_INPUT_DIR = os.environ.get("MAPBOX_INPUT_DIR", os.path.join(SCRIPT_DIR, "
 SEGMENTED_DIR = os.environ.get("SEGMENTED_DIR", os.path.join(SCRIPT_DIR, "received_segmented_mapbox_image"))
 SEGMENT_SERVER_HOST = os.environ.get("SEGMENT_SERVER_HOST", "")
 SEGMENT_SERVER_PORT = int(os.environ.get("SEGMENT_SERVER_PORT", "5555"))
+SEGMENT_SOCKS_PROXY = os.environ.get("SEGMENT_SOCKS_PROXY", "").strip()
 LOW_CONF_SERVER_HOST = os.environ.get("LOW_CONF_SERVER_HOST", "")
 LOW_CONF_SERVER_PORT = int(os.environ.get("LOW_CONF_SERVER_PORT", "5555"))
+LOW_CONF_SOCKS_PROXY = os.environ.get("LOW_CONF_SOCKS_PROXY", SEGMENT_SOCKS_PROXY).strip()
 LOW_CONF_THRESHOLD_PERCENT = float(os.environ.get("LOW_CONF_THRESHOLD_PERCENT", "50.0"))
 LOW_CONF_TIMEOUT_MS = int(os.environ.get("LOW_CONF_TIMEOUT_MS", "20000"))
 
@@ -68,10 +75,18 @@ LAST_CAPTURE_LOG_ID: Optional[str] = None
 LAST_CAPTURE_LOG_TS: Optional[float] = None
 CAMERA_LOCK = threading.Lock()
 CAMERA_LOCK_TIMEOUT_SECONDS = float(os.environ.get("LEAF_CAMERA_LOCK_TIMEOUT_SECONDS", "120"))
+COLLECTION_WORKFLOW_LOCK_PATH = os.environ.get(
+    "LEAF_COLLECTION_WORKFLOW_LOCK_PATH",
+    "/tmp/farmos_leaf_collect_data.lock",
+)
 
 GPS_DEVICE = os.environ.get("GPS_DEVICE", "/dev/ttyACM0")
 GPS_READ_TIMEOUT_SECONDS = float(os.environ.get("GPS_READ_TIMEOUT_SECONDS", "25"))
 PLANT_EXPORT_DIR = os.environ.get("LEAF_EXPORT_DIR", os.path.join(SCRIPT_DIR, "plant_exports"))
+COLLECTION_JOB_DATABASE = os.environ.get(
+    "AUTO_JOB_DATABASE",
+    os.path.join(SCRIPT_DIR, "collection_jobs", "jobs.sqlite3"),
+)
 LOG_BUNDLES = ["activity", "harvest", "input", "maintenance", "observation", "seeding"]
 PENDING_EXPORT_REQUESTS = {}
 PENDING_EXPORT_TTL_SECONDS = int(os.environ.get("LEAF_EXPORT_SELECTION_TTL_SECONDS", "1800"))
@@ -268,15 +283,60 @@ def _camera_session():
 def capture_image(camera_index: int, delay_seconds: float) -> str:
     with _camera_session():
         cap = _open_camera(camera_index)
+        model = None
+        show_live = CAPTURE_LIVE_INFERENCE
+        if show_live:
+            try:
+                from ultralytics import YOLO
+
+                model = YOLO(YOLO_MODEL_PATH)
+            except Exception as exc:
+                cap.release()
+                raise RuntimeError(
+                    f"Identification preview enabled but YOLO model could not be loaded: {exc}"
+                ) from exc
 
         try:
-            end_time = time.time() + max(0.0, delay_seconds)
-            while time.time() < end_time:
-                time.sleep(0.1)
+            if show_live:
+                cv2.namedWindow(IDENTIFICATION_WINDOW_TITLE, cv2.WINDOW_NORMAL)
 
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                raise RuntimeError("Camera opened but failed to read frame.")
+            capture_at = time.time() + max(0.0, delay_seconds)
+            frame = None
+            while frame is None or time.time() < capture_at:
+                ok, current_frame = cap.read()
+                if not ok or current_frame is None:
+                    raise RuntimeError("Camera opened but failed to read frame.")
+                frame = current_frame.copy()
+
+                if show_live:
+                    overlay, label, confidence = _annotate_frame_with_yolo(model, current_frame)
+                    if not overlay.flags.writeable or not overlay.flags.c_contiguous:
+                        overlay = np.ascontiguousarray(overlay).copy()
+                    remaining = max(0.0, capture_at - time.time())
+                    cv2.putText(
+                        overlay,
+                        f"Identification capture in {remaining:.1f}s",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        overlay,
+                        f"YOLO: {label or 'No prediction'} ({confidence:.2f}%)",
+                        (10, overlay.shape[0] - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    cv2.imshow(IDENTIFICATION_WINDOW_TITLE, overlay)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        raise RuntimeError("Cancelled by user during identification preview.")
 
             os.makedirs(CAPTURE_DIR, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -286,6 +346,8 @@ def capture_image(camera_index: int, delay_seconds: float) -> str:
             return image_path
         finally:
             cap.release()
+            if show_live:
+                cv2.destroyWindow(IDENTIFICATION_WINDOW_TITLE)
 
 
 def classify_image(image_path: str) -> tuple[str, float]:
@@ -417,6 +479,20 @@ def parse_multi_llm_responses(remote_text: str) -> list[str]:
             return responses
     except Exception:
         pass
+
+    header_matches = list(
+        re.finditer(r"(?m)^\s*===\s*[^=\r\n]+\s*===\s*$", text)
+    )
+    if header_matches:
+        responses = []
+        for i, match in enumerate(header_matches):
+            start = match.start()
+            end = header_matches[i + 1].start() if i + 1 < len(header_matches) else len(text)
+            chunk = text[start:end].strip()
+            if chunk:
+                responses.append(chunk)
+        if responses:
+            return responses
 
     marker_matches = list(re.finditer(r"(^|\n)\s*(llm|model)\s*([1-9])\s*[:\-]\s*", text, flags=re.IGNORECASE))
     if marker_matches:
@@ -583,6 +659,7 @@ def upsert_plant_asset(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     coordinate_source: str = "",
+    job_id: str = "",
 ):
     global LAST_ASSET_ID, LAST_ASSET_TYPE, LAST_ASSET_NAME, LAST_ASSET_TS
 
@@ -630,6 +707,8 @@ def upsert_plant_asset(
         f"Auto-classified from camera capture. Class={predicted_label}, "
         f"confidence={confidence:.2f}%, image={image_path}, timestamp={now_iso}"
     ]
+    if job_id:
+        note_lines.append(f"Automatic collection job ID: {job_id}")
     remote_doc_text = ""
     non_plant_detected = False
     if confidence < LOW_CONF_THRESHOLD_PERCENT:
@@ -671,7 +750,6 @@ def upsert_plant_asset(
             "id": existing_id,
             "attributes": {
                 "name": asset_name,
-                "status": "active",
                 "notes": notes_field,
             },
             "relationships": {},
@@ -716,7 +794,6 @@ def upsert_plant_asset(
     payload = {
         "attributes": {
             "name": asset_name,
-            "status": "active",
             "notes": notes_field,
         },
         "relationships": {},
@@ -798,7 +875,11 @@ def _annotate_frame_with_yolo(model, frame):
         # OpenCV drawing ops (putText, etc.) require a writable contiguous buffer.
         if not annotated.flags.writeable or not annotated.flags.c_contiguous:
             annotated = np.ascontiguousarray(annotated).copy()
-        if result.boxes is not None and len(result.boxes) > 0:
+        if result.probs is not None:
+            cls_id = int(result.probs.top1)
+            confidence = float(result.probs.top1conf.item() * 100.0)
+            label = str(result.names.get(cls_id, cls_id))
+        elif result.boxes is not None and len(result.boxes) > 0:
             best_idx = int(result.boxes.conf.argmax().item())
             confidence = float(result.boxes.conf[best_idx].item() * 100.0)
             cls_id = int(result.boxes.cls[best_idx].item())
@@ -1031,7 +1112,6 @@ def update_asset_geometry(farm, asset_id: str, asset_type: str, wkt_geometry: st
             "intrinsic_geometry": {"value": wkt_geometry},
             "is_location": True,
             "is_fixed": True,
-            "status": "active",
         },
     }
     response = farm.asset.send(bundle, payload)
@@ -1081,6 +1161,8 @@ def send_image_for_segmentation(
         for attempt in range(1, retries + 2):
             socket = context.socket(zmq.REQ)
             socket.setsockopt(zmq.LINGER, 0)
+            if SEGMENT_SOCKS_PROXY:
+                socket.setsockopt_string(zmq.SOCKS_PROXY, SEGMENT_SOCKS_PROXY)
             try:
                 socket.connect(f"tcp://{server_host}:{server_port}")
                 socket.send_multipart([filename.encode("utf-8"), image_data])
@@ -1136,6 +1218,8 @@ def request_low_confidence_text(
     socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
     socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
     socket.setsockopt(zmq.IMMEDIATE, 1)
+    if LOW_CONF_SOCKS_PROXY:
+        socket.setsockopt_string(zmq.SOCKS_PROXY, LOW_CONF_SOCKS_PROXY)
     try:
         socket.connect(f"tcp://{server_host}:{server_port}")
         socket.send_multipart([filename.encode("utf-8"), image_data])
@@ -1169,7 +1253,7 @@ def collect_and_upload_for_asset(
         camera_index=camera_index,
         image_count=image_count,
         interval_seconds=interval_seconds,
-        start_delay_seconds=0.0,
+        start_delay_seconds=interval_seconds,
     )
     if not upload_to_activity_log:
         return {"log_id": "", "captured": len(images), "uploaded": 0, "saved_paths": images}
@@ -1639,6 +1723,57 @@ def get_server_info() -> str:
 
 
 @mcp.tool()
+def get_collection_job_status(job_id: str) -> str:
+    if not job_id.strip():
+        return "Error: job_id is required."
+    try:
+        from collection_jobs import CollectionJobStore
+
+        job = CollectionJobStore(COLLECTION_JOB_DATABASE).get(job_id.strip())
+        if not job:
+            return f"Job not found: {job_id.strip()}"
+        lines = [
+            f"Job: {job['job_id']}",
+            f"Status: {job['status']}",
+            f"Stage: {job['stage']}",
+            f"Coordinates: {job['latitude']:.8f}, {job['longitude']:.8f}",
+            f"Prediction: {job['predicted_label'] or 'pending'} ({job['confidence']:.2f}%)",
+            f"Asset ID: {job['asset_id'] or 'pending'}",
+            f"Activity log ID: {job['activity_log_id'] or 'pending'}",
+            f"Data images: {len(job['data_images'])}",
+        ]
+        if job["result_message"]:
+            lines.append("Result: " + job["result_message"])
+        if job["error_message"]:
+            lines.append("Error: " + job["error_message"])
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
+def list_collection_jobs(limit: int = 20) -> str:
+    try:
+        from collection_jobs import CollectionJobStore
+
+        jobs = CollectionJobStore(COLLECTION_JOB_DATABASE).list(
+            limit=max(1, min(int(limit), 100))
+        )
+        if not jobs:
+            return "No collection jobs found."
+        return "\n".join(
+            (
+                f"{job['job_id']} | {job['status']} | {job['stage']} | "
+                f"{job['predicted_label'] or 'pending'} | "
+                f"asset={job['asset_id'] or 'pending'}"
+            )
+            for job in jobs
+        )
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
 def classify_camera_and_sync_asset(
     camera_index: int = 0,
     delay_seconds: float = 5.0,
@@ -1817,7 +1952,6 @@ def apply_segmented_image_geometry_to_asset(
         payload = {
             "attributes": {
                 "name": asset_name,
-                "status": "active",
                 "land_type": land_type,
                 "is_location": True,
                 "intrinsic_geometry": {"value": wkt},
@@ -1837,6 +1971,56 @@ def apply_segmented_image_geometry_to_asset(
 
 @mcp.tool()
 def collect_data_with_coordinates(
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    mode: str = "ask",
+    asset_name_override: str = "",
+    camera_index: int = 0,
+    classifier_delay_seconds: float = 5.0,
+    collection_interval_seconds: float = 3.0,
+    collection_duration_seconds: float = 15.0,
+    mapbox_zoom: int = 18,
+    mapbox_width: int = 800,
+    mapbox_height: int = 800,
+    segment_server_host: str = "",
+    segment_server_port: int = 0,
+    upload_to_activity_log: bool = False,
+) -> str:
+    lock_file = open(COLLECTION_WORKFLOW_LOCK_PATH, "a+")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return (
+                "Error: A collect_data_with_coordinates workflow is already running. "
+                "Wait for it to finish; do not retry automatically."
+            )
+
+        return _collect_data_with_coordinates_impl(
+            latitude=latitude,
+            longitude=longitude,
+            mode=mode,
+            asset_name_override=asset_name_override,
+            camera_index=camera_index,
+            classifier_delay_seconds=classifier_delay_seconds,
+            collection_interval_seconds=collection_interval_seconds,
+            collection_duration_seconds=collection_duration_seconds,
+            mapbox_zoom=mapbox_zoom,
+            mapbox_width=mapbox_width,
+            mapbox_height=mapbox_height,
+            segment_server_host=segment_server_host,
+            segment_server_port=segment_server_port,
+            upload_to_activity_log=upload_to_activity_log,
+        )
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
+
+
+def _collect_data_with_coordinates_impl(
     latitude: Optional[float] = None,
     longitude: Optional[float] = None,
     mode: str = "ask",
@@ -1927,19 +2111,6 @@ def collect_data_with_coordinates(
         results = {"images": None, "geometry": None}
         errors = []
 
-        def image_worker():
-            try:
-                results["images"] = collect_and_upload_for_asset(
-                    asset_id=asset_id,
-                    asset_type=asset_type,
-                    camera_index=camera_index,
-                    interval_seconds=collection_interval_seconds,
-                    duration_seconds=collection_duration_seconds,
-                    upload_to_activity_log=upload_to_activity_log,
-                )
-            except Exception as exc:
-                errors.append(f"Image collection failed: {exc}")
-
         def geometry_worker():
             try:
                 results["geometry"] = run_mapbox_segment_and_apply_geometry(
@@ -1956,12 +2127,20 @@ def collect_data_with_coordinates(
             except Exception as exc:
                 errors.append(f"Geometry pipeline failed: {exc}")
 
-        t1 = threading.Thread(target=image_worker, daemon=True)
-        t2 = threading.Thread(target=geometry_worker, daemon=True)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        geometry_thread = threading.Thread(target=geometry_worker, daemon=True)
+        geometry_thread.start()
+        try:
+            results["images"] = collect_and_upload_for_asset(
+                asset_id=asset_id,
+                asset_type=asset_type,
+                camera_index=camera_index,
+                interval_seconds=collection_interval_seconds,
+                duration_seconds=collection_duration_seconds,
+                upload_to_activity_log=upload_to_activity_log,
+            )
+        except Exception as exc:
+            errors.append(f"Image collection failed: {exc}")
+        geometry_thread.join()
 
         lines = [upsert_result["message"]]
         if preview_warning:
