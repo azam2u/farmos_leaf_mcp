@@ -47,6 +47,10 @@ IDENTIFICATION_WINDOW_TITLE = os.environ.get(
     "LEAF_IDENTIFICATION_WINDOW_TITLE",
     "FarmOS Identification Preview",
 )
+UI_PREVIEW_PATH = os.environ.get("LEAF_UI_PREVIEW_PATH", "").strip()
+UI_PREVIEW_INTERVAL_SECONDS = float(
+    os.environ.get("LEAF_UI_PREVIEW_INTERVAL_SECONDS", "0.15")
+)
 CAPTURE_DIR = os.environ.get("LEAF_CAPTURE_DIR", os.path.join(SCRIPT_DIR, "captures"))
 NOTES_HTML_FORMAT = os.environ.get("LEAF_NOTES_HTML_FORMAT", "default").strip() or "default"
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
@@ -267,6 +271,21 @@ def _open_camera(camera_index: int):
     raise RuntimeError(_format_camera_open_error(camera_index))
 
 
+def _publish_ui_preview(frame, last_publish_ts: float) -> float:
+    if not UI_PREVIEW_PATH:
+        return last_publish_ts
+    now = time.monotonic()
+    if now - last_publish_ts < max(0.05, UI_PREVIEW_INTERVAL_SECONDS):
+        return last_publish_ts
+    output_path = os.path.abspath(UI_PREVIEW_PATH)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    temporary_path = output_path + ".tmp.jpg"
+    if cv2.imwrite(temporary_path, frame):
+        os.replace(temporary_path, output_path)
+        return now
+    return last_publish_ts
+
+
 @contextmanager
 def _camera_session():
     acquired = CAMERA_LOCK.acquire(timeout=max(0.0, CAMERA_LOCK_TIMEOUT_SECONDS))
@@ -285,7 +304,8 @@ def capture_image(camera_index: int, delay_seconds: float) -> str:
         cap = _open_camera(camera_index)
         model = None
         show_live = CAPTURE_LIVE_INFERENCE
-        if show_live:
+        render_preview = show_live or bool(UI_PREVIEW_PATH)
+        if render_preview:
             try:
                 from ultralytics import YOLO
 
@@ -302,13 +322,14 @@ def capture_image(camera_index: int, delay_seconds: float) -> str:
 
             capture_at = time.time() + max(0.0, delay_seconds)
             frame = None
+            last_preview_publish = 0.0
             while frame is None or time.time() < capture_at:
                 ok, current_frame = cap.read()
                 if not ok or current_frame is None:
                     raise RuntimeError("Camera opened but failed to read frame.")
                 frame = current_frame.copy()
 
-                if show_live:
+                if render_preview:
                     overlay, label, confidence = _annotate_frame_with_yolo(model, current_frame)
                     if not overlay.flags.writeable or not overlay.flags.c_contiguous:
                         overlay = np.ascontiguousarray(overlay).copy()
@@ -333,10 +354,14 @@ def capture_image(camera_index: int, delay_seconds: float) -> str:
                         2,
                         cv2.LINE_AA,
                     )
-                    cv2.imshow(IDENTIFICATION_WINDOW_TITLE, overlay)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
-                        raise RuntimeError("Cancelled by user during identification preview.")
+                    last_preview_publish = _publish_ui_preview(
+                        overlay, last_preview_publish
+                    )
+                    if show_live:
+                        cv2.imshow(IDENTIFICATION_WINDOW_TITLE, overlay)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (ord("q"), 27):
+                            raise RuntimeError("Cancelled by user during identification preview.")
 
             os.makedirs(CAPTURE_DIR, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -895,7 +920,8 @@ def capture_frames(camera_index: int, image_count: int, interval_seconds: float,
         paths = []
         model = None
         show_live = CAPTURE_LIVE_INFERENCE
-        if show_live:
+        render_preview = show_live or bool(UI_PREVIEW_PATH)
+        if render_preview:
             try:
                 from ultralytics import YOLO
                 model = YOLO(YOLO_MODEL_PATH)
@@ -906,6 +932,7 @@ def capture_frames(camera_index: int, image_count: int, interval_seconds: float,
         try:
             if show_live:
                 cv2.namedWindow(CAPTURE_LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+            last_preview_publish = 0.0
             next_capture_delay = max(0.0, start_delay_seconds)
             for i in range(image_count):
                 last_frame = None
@@ -915,7 +942,7 @@ def capture_frames(camera_index: int, image_count: int, interval_seconds: float,
                     if not ok or frame is None:
                         raise RuntimeError(f"Failed to read frame {i + 1}/{image_count}.")
                     last_frame = frame.copy()
-                    if show_live:
+                    if render_preview:
                         overlay = frame.copy()
                         label = ""
                         confidence = 0.0
@@ -945,10 +972,14 @@ def capture_frames(camera_index: int, image_count: int, interval_seconds: float,
                             2,
                             cv2.LINE_AA,
                         )
-                        cv2.imshow(CAPTURE_LIVE_WINDOW_TITLE, overlay)
-                        key = cv2.waitKey(1) & 0xFF
-                        if key in (ord("q"), 27):
-                            raise RuntimeError("Cancelled by user during live capture preview.")
+                        last_preview_publish = _publish_ui_preview(
+                            overlay, last_preview_publish
+                        )
+                        if show_live:
+                            cv2.imshow(CAPTURE_LIVE_WINDOW_TITLE, overlay)
+                            key = cv2.waitKey(1) & 0xFF
+                            if key in (ord("q"), 27):
+                                raise RuntimeError("Cancelled by user during live capture preview.")
 
                 if last_frame is None:
                     ok, frame = cap.read()

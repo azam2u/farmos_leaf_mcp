@@ -160,6 +160,28 @@ Job stages include:
 The same status is available to MCP clients through `get_collection_job_status`
 and `list_collection_jobs`.
 
+## Dashboard
+
+Start the local dashboard manually:
+
+```bash
+./run_dashboard.sh
+```
+
+Open `http://127.0.0.1:8765`. The dashboard provides:
+
+- startup preflight for farmOS, MCP tools, YOLO, camera, GPS, Mapbox, Tailscale,
+  segmentation, remote LLM review, and the job database
+- camera and GPS connection state
+- Start, Pause/Resume, and Stop controls
+- browser-based YOLO preview
+- live collector logs
+- recent asynchronous collection jobs
+
+The user service `farmos-collector-dashboard.service` starts the dashboard at
+boot. The LXDE autostart entry opens Chromium after the desktop session begins.
+Deployable copies are kept under `deploy/`.
+
 ## Tool Behavior Notes
 
 ### `classify_camera_and_sync_asset`

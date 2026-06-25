@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=farmOS Field Collector
+Comment=Open the farmOS automatic data collection dashboard
+Exec=/home/cvl/farmos_leaf_mcp_work/farmos_leaf_mcp/open_dashboard.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

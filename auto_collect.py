@@ -209,6 +209,28 @@ def print_job(job: dict):
         print("Error:", job["error_message"])
 
 
+def read_control_command(control_file: str) -> str:
+    if not control_file:
+        return "run"
+    try:
+        with open(control_file, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        command = str(payload.get("command", "run")).strip().lower()
+        return command if command in {"run", "pause", "stop"} else "run"
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return "run"
+
+
+def controlled_wait(seconds: float, control_file: str) -> str:
+    end_time = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < end_time:
+        command = read_control_command(control_file)
+        if command in {"pause", "stop"}:
+            return command
+        time.sleep(min(0.25, max(0.0, end_time - time.monotonic())))
+    return read_control_command(control_file)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     database_path = os.environ.get(
@@ -265,6 +287,7 @@ def main() -> int:
         else float(os.environ.get("AUTO_POLL_SECONDS", "10"))
     )
     poll_seconds = max(0.1, configured_poll_seconds)
+    control_file = os.environ.get("AUTO_CONTROL_FILE", "").strip()
     source = make_coordinate_source(args.dummy_move_meters)
     coordinate_source_name = os.environ.get("AUTO_COORDINATE_SOURCE", "dummy").strip().lower()
     stop_requested = False
@@ -291,6 +314,24 @@ def main() -> int:
     )
 
     while not stop_requested:
+        command = read_control_command(control_file)
+        if command == "stop":
+            stop_requested = True
+            break
+        if command == "pause":
+            print("Automatic collection paused.")
+            while not stop_requested:
+                command = read_control_command(control_file)
+                if command == "stop":
+                    stop_requested = True
+                    break
+                if command == "run":
+                    print("Automatic collection resumed.")
+                    break
+                time.sleep(0.25)
+            if stop_requested:
+                break
+
         try:
             coordinate = source.read()
             coordinate_checks += 1
@@ -346,7 +387,9 @@ def main() -> int:
         if args.max_checks > 0 and coordinate_checks >= args.max_checks:
             break
         if not stop_requested:
-            time.sleep(poll_seconds)
+            command = controlled_wait(poll_seconds, control_file)
+            if command == "stop":
+                stop_requested = True
 
     if worker:
         print("Foreground collection stopped; waiting for background jobs to finish...")

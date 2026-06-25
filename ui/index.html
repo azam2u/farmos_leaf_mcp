@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>farmOS Field Collector</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111714;
+      --surface: #19211d;
+      --surface-2: #202b26;
+      --line: #344139;
+      --text: #f1f5f2;
+      --muted: #aebbb3;
+      --green: #58c487;
+      --yellow: #e6b85c;
+      --red: #e26d68;
+      --cyan: #69b7c9;
+      --focus: #9dd7ac;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", sans-serif;
+      min-height: 100vh;
+    }
+    button { font: inherit; letter-spacing: 0; }
+    .topbar {
+      min-height: 76px;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--line);
+      background: #151d19;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .brand h1 { margin: 0; font-size: 25px; font-weight: 680; letter-spacing: 0; }
+    .brand p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .status-line { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); }
+    .dot.running { background: var(--green); }
+    .dot.paused { background: var(--yellow); }
+    main { padding: 18px 24px 28px; }
+    .controls {
+      min-height: 66px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 18px;
+    }
+    .btn {
+      min-width: 110px;
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 16px;
+      color: var(--text);
+      background: var(--surface-2);
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--focus); }
+    .btn:disabled { opacity: .42; cursor: not-allowed; }
+    .btn.start { background: #246c45; border-color: #39845b; }
+    .btn.pause { background: #705a27; border-color: #92773a; }
+    .btn.stop { background: #703934; border-color: #95504a; }
+    .btn.secondary { margin-left: auto; min-width: 44px; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(430px, 1.1fr) minmax(360px, .9fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .section {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .section-header {
+      height: 44px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 14px;
+      font-weight: 650;
+    }
+    .preview {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      max-height: 570px;
+      background: #080b09;
+      object-fit: contain;
+      display: block;
+    }
+    .preview-empty {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      background: #080b09;
+    }
+    .health-grid {
+      padding: 10px 14px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0 18px;
+    }
+    .health-row {
+      min-height: 52px;
+      border-bottom: 1px solid #2b3731;
+      display: grid;
+      grid-template-columns: 14px minmax(90px, .7fr) minmax(130px, 1.3fr);
+      align-items: center;
+      gap: 9px;
+      font-size: 12px;
+    }
+    .health-row .lamp { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+    .health-row.ok .lamp { background: var(--green); }
+    .health-row.warning .lamp { background: var(--yellow); }
+    .health-detail { color: var(--muted); overflow-wrap: anywhere; }
+    .jobs { max-height: 280px; overflow: auto; }
+    .job {
+      padding: 10px 14px;
+      border-bottom: 1px solid #2b3731;
+      display: grid;
+      grid-template-columns: minmax(90px, 1fr) 110px 145px;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .job-id { font-family: "DejaVu Sans Mono", monospace; color: var(--cyan); }
+    .job-stage, .job-plant { color: var(--muted); }
+    .logs {
+      height: 280px;
+      overflow: auto;
+      padding: 10px 12px;
+      margin: 0;
+      background: #0d120f;
+      color: #c8d5cd;
+      font-family: "DejaVu Sans Mono", monospace;
+      font-size: 11px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    .boot-overlay {
+      position: fixed;
+      inset: 0;
+      background: #101713;
+      z-index: 20;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .boot-inner { width: min(720px, 100%); }
+    .boot-inner h2 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    .boot-inner p { color: var(--muted); margin: 0 0 20px; }
+    .boot-progress { height: 6px; background: var(--surface-2); overflow: hidden; }
+    .boot-progress span {
+      display: block;
+      height: 100%;
+      width: 35%;
+      background: var(--green);
+      animation: scan 1.2s infinite ease-in-out;
+    }
+    @keyframes scan { from { transform: translateX(-100%); } to { transform: translateX(390%); } }
+    @media (max-width: 900px) {
+      main { padding: 12px; }
+      .topbar { padding: 12px 14px; }
+      .layout { grid-template-columns: 1fr; }
+      .health-grid { grid-template-columns: 1fr; }
+      .controls { flex-wrap: wrap; padding-bottom: 12px; }
+      .btn.secondary { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="boot" class="boot-overlay">
+    <div class="boot-inner">
+      <h2>farmOS Field Collector</h2>
+      <p>Checking camera, GPS, farmOS, models, networking, and remote services.</p>
+      <div class="boot-progress"><span></span></div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <h1>farmOS Field Collector</h1>
+      <p>Automatic plant capture, review, mapping, and synchronization</p>
+    </div>
+    <div class="status-line"><span id="stateDot" class="dot"></span><span id="stateText">Stopped</span></div>
+  </header>
+
+  <main>
+    <div class="controls">
+      <button id="startBtn" class="btn start">Start</button>
+      <button id="pauseBtn" class="btn pause" disabled>Pause</button>
+      <button id="stopBtn" class="btn stop" disabled>Stop</button>
+      <button id="healthBtn" class="btn secondary" title="Run health checks again">Refresh checks</button>
+    </div>
+
+    <div class="layout">
+      <div>
+        <section class="section">
+          <div class="section-header"><span>YOLO Camera Preview</span><span id="previewStatus">Waiting</span></div>
+          <div id="previewEmpty" class="preview-empty">Press Start to begin camera collection</div>
+          <img id="preview" class="preview" alt="YOLO camera preview" hidden>
+        </section>
+
+        <section class="section" style="margin-top:18px">
+          <div class="section-header"><span>System Preflight</span><span id="healthTime"></span></div>
+          <div id="healthGrid" class="health-grid"></div>
+        </section>
+      </div>
+
+      <div>
+        <section class="section">
+          <div class="section-header"><span>Collection Jobs</span><span id="jobCount">0</span></div>
+          <div id="jobs" class="jobs"></div>
+        </section>
+
+        <section class="section" style="margin-top:18px">
+          <div class="section-header"><span>Live Logs</span><span id="logState">Idle</span></div>
+          <pre id="logs" class="logs"></pre>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let lastLogId = 0;
+    let bootDismissed = false;
+    let healthReady = false;
+
+    async function post(action) {
+      const response = await fetch(`/api/control/${action}`, {method: "POST"});
+      const data = await response.json();
+      appendLocal(data.message);
+      await refresh();
+    }
+
+    function appendLocal(text) {
+      const logs = document.getElementById("logs");
+      logs.textContent += `[${new Date().toLocaleTimeString()}] ${text}\n`;
+      logs.scrollTop = logs.scrollHeight;
+    }
+
+    function renderCollector(collector) {
+      const state = collector.state;
+      document.getElementById("stateText").textContent = state[0].toUpperCase() + state.slice(1);
+      const dot = document.getElementById("stateDot");
+      dot.className = `dot ${state}`;
+      const stopped = state === "stopped";
+      const paused = state === "paused";
+      document.getElementById("startBtn").disabled = !healthReady;
+      document.getElementById("startBtn").hidden = !stopped;
+      document.getElementById("pauseBtn").hidden = stopped;
+      document.getElementById("stopBtn").hidden = stopped;
+      document.getElementById("pauseBtn").disabled = state === "stopping";
+      document.getElementById("pauseBtn").textContent = paused ? "Resume" : "Pause";
+      document.getElementById("stopBtn").disabled = state === "stopping";
+      document.getElementById("logState").textContent = state;
+    }
+
+    function renderHealth(health) {
+      const grid = document.getElementById("healthGrid");
+      grid.innerHTML = "";
+      for (const check of health.checks || []) {
+        const row = document.createElement("div");
+        row.className = `health-row ${check.status}`;
+        row.innerHTML = `<span class="lamp"></span><strong>${check.name}</strong><span class="health-detail">${check.detail}</span>`;
+        grid.appendChild(row);
+      }
+      document.getElementById("healthTime").textContent = health.checking ? "Checking..." : health.updated_at;
+      healthReady = !health.checking && !(health.checks || []).some(check => check.required && check.status === "error");
+      document.getElementById("startBtn").disabled = !healthReady;
+      if (!health.checking && !bootDismissed) {
+        bootDismissed = true;
+        document.getElementById("boot").style.display = "none";
+      }
+    }
+
+    function renderJobs(jobs) {
+      const root = document.getElementById("jobs");
+      root.innerHTML = "";
+      document.getElementById("jobCount").textContent = `${jobs.length} recent`;
+      if (!jobs.length) {
+        root.innerHTML = `<div class="job"><span class="job-stage">No jobs yet</span></div>`;
+        return;
+      }
+      for (const job of jobs) {
+        const row = document.createElement("div");
+        row.className = "job";
+        row.title = job.result_message || job.error_message || "";
+        row.innerHTML = `<span class="job-id">${job.job_id.slice(0, 10)}</span><span class="job-stage">${job.status}<br>${job.stage}</span><span class="job-plant">${job.predicted_label || "Pending"}<br>${Number(job.confidence).toFixed(1)}%</span>`;
+        root.appendChild(row);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/status", {cache: "no-store"});
+        const data = await response.json();
+        renderCollector(data.collector);
+        renderHealth(data.health);
+        renderJobs(data.jobs);
+        const preview = document.getElementById("preview");
+        const empty = document.getElementById("previewEmpty");
+        if (data.preview_available) {
+          preview.src = `/api/preview?t=${Date.now()}`;
+          preview.hidden = false;
+          empty.hidden = true;
+          document.getElementById("previewStatus").textContent = "Live";
+        } else {
+          document.getElementById("previewStatus").textContent = "Waiting";
+        }
+      } catch (error) {
+        appendLocal(`Dashboard status error: ${error}`);
+      }
+    }
+
+    async function refreshLogs() {
+      try {
+        const response = await fetch(`/api/logs?after=${lastLogId}`, {cache: "no-store"});
+        const data = await response.json();
+        const logs = document.getElementById("logs");
+        for (const entry of data.logs) {
+          logs.textContent += `[${entry.time}] ${entry.text}\n`;
+          lastLogId = Math.max(lastLogId, entry.id);
+        }
+        if (data.logs.length) logs.scrollTop = logs.scrollHeight;
+      } catch (_) {}
+    }
+
+    document.getElementById("startBtn").onclick = () => post("start");
+    document.getElementById("pauseBtn").onclick = () => {
+      const paused = document.getElementById("stateText").textContent.toLowerCase() === "paused";
+      post(paused ? "resume" : "pause");
+    };
+    document.getElementById("stopBtn").onclick = () => post("stop");
+    document.getElementById("healthBtn").onclick = async () => {
+      await fetch("/api/health/refresh", {method: "POST"});
+      await refresh();
+    };
+
+    refresh();
+    refreshLogs();
+    setInterval(refresh, 1000);
+    setInterval(refreshLogs, 500);
+  </script>
+</body>
+</html>

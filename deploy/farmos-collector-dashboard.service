@@ -1,0 +1,14 @@
+[Unit]
+Description=farmOS Field Collector Dashboard
+After=network-online.target tailscaled-userspace.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cvl/farmos_leaf_mcp_work/farmos_leaf_mcp
+ExecStart=/home/cvl/farmos_leaf_mcp_work/farmos_leaf_mcp/run_dashboard.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
